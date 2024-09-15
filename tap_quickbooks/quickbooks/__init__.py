@@ -11,11 +11,17 @@ import singer.utils as singer_utils
 import os;
 from typing import Dict
 from singer import metadata, metrics
+from tap_quickbooks.quickbooks.reportstreams.MonthlyBalanceSheetReport import MonthlyBalanceSheetReport
 from tap_quickbooks.quickbooks.reportstreams.ProfitAndLossDetailReport import ProfitAndLossDetailReport
+from tap_quickbooks.quickbooks.reportstreams.ProfitAndLossReport import ProfitAndLossReport
 from tap_quickbooks.quickbooks.reportstreams.BalanceSheetReport import BalanceSheetReport
-from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerReport import GeneralLedgerReport
+from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerAccrualReport import GeneralLedgerAccrualReport
+from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerCashReport import GeneralLedgerCashReport
 from tap_quickbooks.quickbooks.reportstreams.CashFlowReport import CashFlowReport
+from tap_quickbooks.quickbooks.reportstreams.DailyCashFlowReport import DailyCashFlowReport
+from tap_quickbooks.quickbooks.reportstreams.MonthlyCashFlowReport import MonthlyCashFlowReport
 from tap_quickbooks.quickbooks.reportstreams.TransactionListReport import TransactionListReport
+from tap_quickbooks.quickbooks.reportstreams.ARAgingSummaryReport import ARAgingSummaryReport
 
 from tap_quickbooks.quickbooks.rest import Rest
 from tap_quickbooks.quickbooks.exceptions import (
@@ -107,7 +113,15 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
     }
 
     array_type = {
-        "type": "array"
+        "type": ["null", "array"]
+    }
+
+    ref_type = {
+        "type": object_type["type"],
+        "properties": {
+            "value": string_type,
+            "name": string_type,
+        }
     }
 
     qb_types = {
@@ -120,7 +134,8 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
         "object_reference": string_type,
         "email": string_type,
         "address": string_type,
-        "metadata": string_type
+        "metadata": string_type,
+        "ref_type": ref_type
     }
 
     qb_types["custom_field"] = {
@@ -144,21 +159,27 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
             "SalesItemLineDetail": {
                 "type": object_type["type"],
                 "properties": {
-                    "ItemRef": qb_types["object_reference"],
-                    "ClassRef": qb_types["object_reference"],
-                    "ItemAccountRef": qb_types["object_reference"],
-                    "TaxCodeRef": qb_types["object_reference"],
+                    "ItemRef": qb_types["ref_type"],
+                    "ClassRef": qb_types["ref_type"],
+                    "ItemAccountRef": qb_types["ref_type"],
+                    "TaxCodeRef": qb_types["ref_type"],
                     "Qty": number_type,
-                    "UnitPrice": number_type
+                    "UnitPrice": number_type,
+                    "ServiceDate": qb_types["datetime"],
+                    "Description" : string_type
                 }
             },
             "SubTotalLineDetail": {
-                "type": object_type["type"]
+                "type": object_type["type"],
+                "properties": {
+                    "ItemRef": qb_types["ref_type"]
+                }
             },
             "DiscountLineDetail": {
                 "type": object_type["type"],
                 "properties": {
-                    "DiscountAccountRef": qb_types["object_reference"]
+                    "DiscountAccountRef": qb_types["object_reference"],
+                    "DiscountPercent": number_type
                 }
             },
             "DescriptionLineDetail": {
@@ -197,6 +218,50 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
         }
     }
 
+    qb_types["LinkedTxn"] = {
+        "type": object_type["type"],
+        "properties": {
+            "TxnId": string_type,
+            "TxnType": string_type,
+        }
+    }
+
+    qb_types["any"] = {
+        "type": object_type["type"],
+        "properties": {
+            "name": string_type,
+            "declaredType": string_type,
+            "scope": string_type,
+            "value": {
+                "type": object_type["type"],
+                "properties": {
+                    "Name": string_type,
+                    "Value": string_type,
+                }
+            },
+            "nil": boolean_type,
+            "globalScope": boolean_type,
+            "typeSubstituted": boolean_type,
+        }
+    }
+
+    qb_types["payment_line"] = {
+        "type": object_type["type"],
+        "properties": {
+            "Amount": number_type,
+            "LinkedTxn": {"type": "array", "items": qb_types["LinkedTxn"]},
+            "LineEx": {
+                "type": object_type["type"],
+                "properties": {
+                    "any": {
+                        "type": "array", 
+                        "items": qb_types["any"]
+                    }
+                }
+            }
+        }
+    }
+
     qb_type = field['type']
     property_schema = qb_types[qb_type]
     if qb_type == 'array':
@@ -204,6 +269,8 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
 
     return property_schema, mdata
 
+class RetriableApiError(Exception):
+    pass
 
 class Quickbooks():
     # pylint: disable=too-many-instance-attributes,too-many-arguments
@@ -215,11 +282,25 @@ class Quickbooks():
                  quota_percent_per_run=None,
                  quota_percent_total=None,
                  is_sandbox=None,
+                 include_deleted = None,
                  select_fields_by_default=None,
                  default_start_date=None,
                  api_type=None,
+                 report_period_days = None,
+                 reports_full_sync = None,
+                 gl_full_sync = None,
+                 gl_weekly = None,
+                 gl_daily = None,
+                 gl_basic_fields = None,
                  realm_id=None):
         self.api_type = api_type.upper() if api_type else None
+        self.report_period_days = report_period_days
+        self.gl_full_sync = gl_full_sync
+        self.reports_full_sync = reports_full_sync
+        self.gl_weekly = gl_weekly
+        self.gl_daily = gl_daily
+        self.gl_basic_fields = gl_basic_fields
+        self.include_deleted = include_deleted
         self.realm_id = realm_id
         self.refresh_token = refresh_token
         self.token = token
@@ -291,7 +372,7 @@ class Quickbooks():
 
     # pylint: disable=too-many-arguments
     @backoff.on_exception(backoff.expo,
-                          requests.exceptions.ConnectionError,
+                          (requests.exceptions.ConnectionError,RetriableApiError),
                           max_tries=10,
                           factor=2,
                           on_backoff=log_backoff_attempt)
@@ -304,7 +385,10 @@ class Quickbooks():
             resp = self.session.post(url, headers=headers, data=body)
         else:
             raise TapQuickbooksException("Unsupported HTTP method")
-
+        if resp.status_code in [400, 500]:
+            if "Authorization Failure" in resp.text:
+                self.login()
+            raise RetriableApiError(resp.text)
         try:
             resp.raise_for_status()
         except RequestException as ex:
@@ -339,10 +423,21 @@ class Quickbooks():
             self.access_token = auth['access_token']
 
             new_refresh_token = auth['refresh_token']
+            LOGGER.info(F"REFRESH TOKEN: {new_refresh_token}")
+
+            # persist access_token
+            parser = argparse.ArgumentParser()
+            parser.add_argument('-c', '--config', help='Config file', required=True)
+            _args, unknown = parser.parse_known_args()
+            config_file = _args.config
+            config_content = read_json_file(config_file)
+            config_content['access_token'] = self.access_token
+            write_json_file(config_file, config_content)
 
             # Check if the refresh token is update, if so update the config file with new refresh token.
             if new_refresh_token != self.refresh_token:
                 LOGGER.info(f"Old refresh token [{self.refresh_token}] expired.")
+                LOGGER.info("New Refresh token: {}".format(new_refresh_token))
                 parser = argparse.ArgumentParser()
                 parser.add_argument('-c', '--config', help='Config file', required=True)
                 _args, unknown = parser.parse_known_args()
@@ -427,14 +522,29 @@ class Quickbooks():
 
     def query_report(self, catalog_entry, state, state_passed):
         start_date = singer_utils.strptime_with_tz(self.get_start_date(state, catalog_entry))
+        if self.reports_full_sync:
+            state_passed = None
+
         if catalog_entry["stream"] == "BalanceSheetReport":
             reader = BalanceSheetReport(self, start_date, state_passed)
-        elif catalog_entry["stream"] == "GeneralLedgerReport":
-            reader = GeneralLedgerReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "MonthlyBalanceSheetReport":
+            reader = MonthlyBalanceSheetReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "GeneralLedgerAccrualReport":
+            reader = GeneralLedgerAccrualReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "GeneralLedgerCashReport":
+            reader = GeneralLedgerCashReport(self, start_date, state_passed)
         elif catalog_entry["stream"] == "CashFlowReport":
             reader = CashFlowReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "DailyCashFlowReport":
+            reader = DailyCashFlowReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "MonthlyCashFlowReport":
+            reader = MonthlyCashFlowReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "ARAgingSummaryReport":
+            reader = ARAgingSummaryReport(self, start_date, state_passed)
         elif catalog_entry["stream"] == "TransactionListReport":
             reader = TransactionListReport(self, start_date, state_passed)
+        elif catalog_entry["stream"] == "ProfitAndLossReport":
+            reader = ProfitAndLossReport(self, start_date, state_passed)
         else:
             reader = ProfitAndLossDetailReport(self, start_date, state_passed)
         return reader.sync(catalog_entry)

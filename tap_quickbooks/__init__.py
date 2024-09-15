@@ -25,7 +25,8 @@ CONFIG = {
     'refresh_token': None,
     'client_id': None,
     'client_secret': None,
-    'start_date': None
+    'start_date': None,
+    'include_deleted': None
 }
 
 REPLICATION_KEY="MetaData.LastUpdatedTime"
@@ -141,7 +142,20 @@ def do_discover(qb):
                 {
                     'replication-method': 'FULL_TABLE',
                     'reason': 'No replication keys found from the Quickbooks API'})
-
+        if sobject_name in [
+            "BalanceSheetReport",
+            "MonthlyBalanceSheetReport",
+            "CashFlowReport",
+            "DailyCashFlowReport",
+            "MonthlyCashFlowReport",
+            "GeneralLedgerAccrualReport",
+            "GeneralLedgerCashReport",
+            "ARAgingSummaryReport",
+            "ProfitAndLossDetailReport",
+            "ProfitAndLossReport",
+            "TransactionListReport",
+        ]:
+            key_properties = []
         mdata = metadata.write(mdata, (), 'table-key-properties', key_properties)
 
         schema = {
@@ -263,8 +277,15 @@ def main_impl():
             is_sandbox=CONFIG.get('is_sandbox'),
             select_fields_by_default=CONFIG.get('select_fields_by_default'),
             default_start_date=CONFIG.get('start_date'),
+            include_deleted = CONFIG.get('include_deleted'),
             api_type='REST',
-            realm_id = CONFIG.get('realmId'))
+            realm_id = CONFIG.get('realmId'),
+            report_period_days = CONFIG.get('report_period_days'),
+            reports_full_sync = CONFIG.get('reports_full_sync', False),
+            gl_full_sync = CONFIG.get('gl_full_sync'),
+            gl_weekly = CONFIG.get('gl_weekly', False),
+            gl_daily = CONFIG.get('gl_daily', False),
+            gl_basic_fields = CONFIG.get('gl_basic_fields', False))
         qb.login()
 
         if args.discover:
@@ -296,3 +317,6 @@ def main():
     except Exception as e:
         LOGGER.critical(e)
         raise e
+
+if __name__ == "__main__":
+    main()

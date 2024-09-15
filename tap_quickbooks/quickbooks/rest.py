@@ -63,16 +63,17 @@ class Rest():
                     yield record
 
         except HTTPError as ex:
-            response = ex.response.json()
-            if isinstance(response, list) and response[0].get("errorCode") == "QUERY_TIMEOUT":
-                start_date = singer_utils.strptime_with_tz(start_date_str)
-                day_range = (end_date - start_date).days
-                LOGGER.info(
-                    "Quickbooks returned QUERY_TIMEOUT querying %d days of %s",
-                    day_range,
-                    catalog_entry['stream'])
-                retryable = True
-            else:
+            try:
+                response = ex.response.json()
+                if isinstance(response, list) and response[0].get("errorCode") == "QUERY_TIMEOUT":
+                    start_date = singer_utils.strptime_with_tz(start_date_str)
+                    day_range = (end_date - start_date).days
+                    LOGGER.info(
+                        "Quickbooks returned QUERY_TIMEOUT querying %d days of %s",
+                        day_range,
+                        catalog_entry['stream'])
+                    retryable = True
+            except:
                 raise ex
 
         if retryable:
@@ -99,9 +100,25 @@ class Rest():
         headers["Content-Type"] = "application/json"
 
         query = params['query']
-        offset = 0;
+        offset = 0
         max = 100
+        page = 0
         while True:
+            headers.update(self.qb._get_standard_headers())
+            records_deleted = []
+            excluded_entities = ["Bill", "Payment", "Transfer", "CompanyInfo", "CreditMemo", "Invoice",
+                                 "JournalEntry", "Preferences", "Purchase", "SalesReceipt", "TimeActivity", "BillPayment","Estimate"]
+            if self.qb.include_deleted and stream not in excluded_entities:
+                # Get the deleted records first
+                if "WHERE" in query:
+                    query_deleted = query.replace("WHERE", "where Active = false and")
+                    params['query'] = f"{query_deleted}  STARTPOSITION {offset} MAXRESULTS {max}"
+                else:
+                    params['query'] = f"{query} where Active = false  STARTPOSITION {offset} MAXRESULTS {max}" 
+                resp = self.qb._make_request('GET', url, headers=headers, params=params)
+                resp_json_deleted = resp.json()
+                if resp_json_deleted['QueryResponse'].get(stream):
+                    records_deleted = resp_json_deleted['QueryResponse'][stream];
             params['query'] = f"{query}  STARTPOSITION {offset} MAXRESULTS {max}"
             resp = self.qb._make_request('GET', url, headers=headers, params=params)
             resp_json = resp.json()
@@ -113,7 +130,9 @@ class Rest():
             if count == 0:
                 break;
 
+            page += 1
             records = resp_json['QueryResponse'][stream];
+            records = records + records_deleted
 
             for i, rec in enumerate(records):
                 yield rec
@@ -122,4 +141,4 @@ class Rest():
             if count < max:
                 break;
 
-            offset += max
+            offset = (max * page) + 1

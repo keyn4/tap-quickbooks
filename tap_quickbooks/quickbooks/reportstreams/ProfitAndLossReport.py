@@ -10,9 +10,9 @@ from dateutil.parser import parse
 LOGGER = singer.get_logger()
 NUMBER_OF_PERIODS = 3
 
-class ProfitAndLossDetailReport(QuickbooksStream):
-    tap_stream_id: ClassVar[str] = 'ProfitAndLossDetailReport'
-    stream: ClassVar[str] = 'ProfitAndLossDetailReport'
+class ProfitAndLossReport(QuickbooksStream):
+    tap_stream_id: ClassVar[str] = 'ProfitAndLossReport'
+    stream: ClassVar[str] = 'ProfitAndLossReport'
     key_properties: ClassVar[List[str]] = []
     replication_method: ClassVar[str] = 'FULL_TABLE'
     current_account = {}
@@ -63,44 +63,6 @@ class ProfitAndLossDetailReport(QuickbooksStream):
     def sync(self, catalog_entry):
         full_sync = not self.state_passed
 
-        cols = [
-            "create_by",
-            "create_date",
-            "doc_num",
-            "last_mod_by",
-            "last_mod_date",
-            "memo",
-            "name",
-            "pmt_mthd",
-            "split_acc",
-            "tx_date",
-            "txn_type",
-            "tax_code",
-            "klass_name",
-            "dept_name",
-            "debt_amt",
-            "debt_home_amt",
-            "credit_amt",
-            "credit_home_amt",
-            "currency",
-            "exch_rate",
-            "nat_open_bal",
-            "nat_home_open_bal",
-            "nat_foreign_open_bal",
-            "subt_nat_amount",
-            "subt_nat_home_amount",
-            "subt_nat_amount_nt",
-            "subt_nat_amount_home_nt",
-            "rbal_nat_amount",
-            "rbal_nat_home_amount",
-            "rbal_nat_amount_nt",
-            "rbal_nat_amount_home_nt",
-            "tax_amount",
-            "home_tax_amount",
-            "net_amount",
-            "home_net_amount",
-        ]
-
         if full_sync:
             start_date = self.start_date.date()
             delta = 30
@@ -114,12 +76,11 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                 params = {
                     "start_date": start_date.strftime("%Y-%m-%d"),
                     "end_date": end_date.strftime("%Y-%m-%d"),
-                    "accounting_method": "Accrual",
-                    "columns": ",".join(cols)
+                    "accounting_method": "Accrual"
                 }
 
-                LOGGER.info(f"Fetch Journal Report for period {params['start_date']} to {params['end_date']}")
-                resp = self._get(report_entity='ProfitAndLossDetail', params=params)
+                LOGGER.info(f"Fetch Profit and Loss Report for period {params['start_date']} to {params['end_date']}")
+                resp = self._get(report_entity='ProfitAndLoss', params=params)
                 start_date = end_date + datetime.timedelta(1)
 
                 # Get column metadata.
@@ -141,7 +102,7 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                 # Zip columns and row data.
                 for raw_row in output:
                     row = dict(zip(columns, raw_row))
-                    if not row.get("Amount"):
+                    if not row.get("Total"):
                         # If a row is missing the amount, skip it
                         continue
 
@@ -154,8 +115,9 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                         else:
                             cleansed_row[k] = v
 
-                    cleansed_row["Amount"] = float(cleansed_row.get("Amount")) if cleansed_row.get("Amount") else None
-                    cleansed_row["Balance"] = float(cleansed_row.get("Balance")) if cleansed_row.get("Amount") else None
+                    if "" in cleansed_row:
+                        cleansed_row['Account'] = cleansed_row.pop("")
+
                     cleansed_row["SyncTimestampUtc"] = singer.utils.strftime(singer.utils.now(), "%Y-%m-%dT%H:%M:%SZ")
                     if cleansed_row.get('Date'):
                         try:
@@ -173,15 +135,15 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                 params = {
                     "start_date": start_date.strftime("%Y-%m-%d"),
                     "end_date": end_date.strftime("%Y-%m-%d"),
-                    "accounting_method": "Accrual",
-                    "columns": ",".join(cols)
+                    "accounting_method": "Accrual"
                 }
 
-                LOGGER.info(f"Fetch Journal Report for period {params['start_date']} to {params['end_date']}")
-                resp = self._get(report_entity='ProfitAndLossDetail', params=params)
+                LOGGER.info(f"Fetch PnL Report for period {params['start_date']} to {params['end_date']}")
+                resp = self._get(report_entity='ProfitAndLoss', params=params)
 
                 # Get column metadata.
                 columns = self._get_column_metadata(resp)
+                columns += ["Account"]
 
                 # Recursively get row data.
                 row_group = resp.get("Rows")
@@ -200,7 +162,7 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                 # Zip columns and row data.
                 for raw_row in output:
                     row = dict(zip(columns, raw_row))
-                    if not row.get("Amount"):
+                    if not row.get("Total"):
                         # If a row is missing the amount, skip it
                         continue
 
@@ -212,6 +174,9 @@ class ProfitAndLossDetailReport(QuickbooksStream):
                                 cleansed_row[f"{k}Id"] = v.get("id")
                         else:
                             cleansed_row[k] = v
+
+                    if "" in cleansed_row:
+                        cleansed_row['Account'] = cleansed_row.pop("")
 
                     cleansed_row["Amount"] = float(cleansed_row.get("Amount")) if cleansed_row.get("Amount") else None
                     cleansed_row["Balance"] = float(cleansed_row.get("Balance")) if cleansed_row.get("Amount") else None

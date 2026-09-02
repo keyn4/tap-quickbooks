@@ -6,16 +6,24 @@ import time
 import backoff
 import requests
 from requests.exceptions import RequestException
+from hotglue_etl_exceptions import InvalidCredentialsError
 import singer
 import singer.utils as singer_utils
 import os;
 from typing import Dict
 from singer import metadata, metrics
+from tap_quickbooks.quickbooks.reportstreams.MonthlyBalanceSheetReport import MonthlyBalanceSheetReport
 from tap_quickbooks.quickbooks.reportstreams.ProfitAndLossDetailReport import ProfitAndLossDetailReport
+from tap_quickbooks.quickbooks.reportstreams.ProfitAndLossReport import ProfitAndLossReport
 from tap_quickbooks.quickbooks.reportstreams.BalanceSheetReport import BalanceSheetReport
-from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerReport import GeneralLedgerReport
+from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerAccrualReport import GeneralLedgerAccrualReport
+from tap_quickbooks.quickbooks.reportstreams.GeneralLedgerCashReport import GeneralLedgerCashReport
 from tap_quickbooks.quickbooks.reportstreams.CashFlowReport import CashFlowReport
+from tap_quickbooks.quickbooks.reportstreams.DailyCashFlowReport import DailyCashFlowReport
+from tap_quickbooks.quickbooks.reportstreams.MonthlyCashFlowReport import MonthlyCashFlowReport
 from tap_quickbooks.quickbooks.reportstreams.TransactionListReport import TransactionListReport
+from tap_quickbooks.quickbooks.reportstreams.ARAgingSummaryReport import ARAgingSummaryReport
+from tap_quickbooks.util import mask_secret, redact_for_log, save_api_usage
 
 from tap_quickbooks.quickbooks.rest import Rest
 from tap_quickbooks.quickbooks.exceptions import (
@@ -107,7 +115,15 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
     }
 
     array_type = {
-        "type": "array"
+        "type": ["null", "array"]
+    }
+
+    ref_type = {
+        "type": object_type["type"],
+        "properties": {
+            "value": string_type,
+            "name": string_type,
+        }
     }
 
     qb_types = {
@@ -120,7 +136,8 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
         "object_reference": string_type,
         "email": string_type,
         "address": string_type,
-        "metadata": string_type
+        "metadata": string_type,
+        "ref_type": ref_type
     }
 
     qb_types["custom_field"] = {
@@ -144,21 +161,27 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
             "SalesItemLineDetail": {
                 "type": object_type["type"],
                 "properties": {
-                    "ItemRef": qb_types["object_reference"],
-                    "ClassRef": qb_types["object_reference"],
-                    "ItemAccountRef": qb_types["object_reference"],
-                    "TaxCodeRef": qb_types["object_reference"],
+                    "ItemRef": qb_types["ref_type"],
+                    "ClassRef": qb_types["ref_type"],
+                    "ItemAccountRef": qb_types["ref_type"],
+                    "TaxCodeRef": qb_types["ref_type"],
                     "Qty": number_type,
-                    "UnitPrice": number_type
+                    "UnitPrice": number_type,
+                    "ServiceDate": qb_types["datetime"],
+                    "Description" : string_type
                 }
             },
             "SubTotalLineDetail": {
-                "type": object_type["type"]
+                "type": object_type["type"],
+                "properties": {
+                    "ItemRef": qb_types["ref_type"]
+                }
             },
             "DiscountLineDetail": {
                 "type": object_type["type"],
                 "properties": {
-                    "DiscountAccountRef": qb_types["object_reference"]
+                    "DiscountAccountRef": qb_types["object_reference"],
+                    "DiscountPercent": number_type
                 }
             },
             "DescriptionLineDetail": {
@@ -197,6 +220,68 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
         }
     }
 
+    qb_types["LinkedTxn"] = {
+        "type": object_type["type"],
+        "properties": {
+            "TxnId": string_type,
+            "TxnType": string_type,
+        }
+    }
+
+    qb_types["any"] = {
+        "type": object_type["type"],
+        "properties": {
+            "name": string_type,
+            "declaredType": string_type,
+            "scope": string_type,
+            "value": {
+                "type": object_type["type"],
+                "properties": {
+                    "Name": string_type,
+                    "Value": string_type,
+                }
+            },
+            "nil": boolean_type,
+            "globalScope": boolean_type,
+            "typeSubstituted": boolean_type,
+        }
+    }
+
+    qb_types["payment_line"] = {
+        "type": object_type["type"],
+        "properties": {
+            "Amount": number_type,
+            "LinkedTxn": {"type": "array", "items": qb_types["LinkedTxn"]},
+            "LineEx": {
+                "type": object_type["type"],
+                "properties": {
+                    "any": {
+                        "type": "array", 
+                        "items": qb_types["any"]
+                    }
+                }
+            }
+        }
+    }
+
+    qb_types["contact_info"] = {
+        "type": object_type["type"],
+        "properties": {
+            "Type": string_type,
+            "Telephone": string_type,
+        }
+    }
+
+    qb_types["vendor_payment_bank_detail"] = {
+        "type": object_type["type"],
+        "properties": {
+            "BankAccountName": string_type,
+            "BankBranchIdentifier": string_type,
+            "BankAccountNumber": string_type,
+            "StatementText": string_type,
+        }
+    }
+
     qb_type = field['type']
     property_schema = qb_types[qb_type]
     if qb_type == 'array':
@@ -204,6 +289,8 @@ def field_to_property_schema(field, mdata):  # pylint:disable=too-many-branches
 
     return property_schema, mdata
 
+class RetriableApiError(Exception):
+    pass
 
 class Quickbooks():
     # pylint: disable=too-many-instance-attributes,too-many-arguments
@@ -215,11 +302,33 @@ class Quickbooks():
                  quota_percent_per_run=None,
                  quota_percent_total=None,
                  is_sandbox=None,
+                 include_deleted = None,
                  select_fields_by_default=None,
                  default_start_date=None,
                  api_type=None,
-                 realm_id=None):
+                 report_period_days = None,
+                 reports_full_sync = None,
+                 gl_full_sync = None,
+                 gl_weekly = None,
+                 gl_daily = None,
+                 gl_basic_fields = None,
+                 hg_sync_output = None,
+                 realm_id = None,
+                 report_periods = None,
+                 selected_filters = None,
+                 download_attachments = None):
+        
+        if not realm_id:
+            raise TapQuickbooksException("The 'realmId' is missing from the configuration file. It is a required field and cannot be empty.")
+            
         self.api_type = api_type.upper() if api_type else None
+        self.report_period_days = report_period_days
+        self.gl_full_sync = gl_full_sync
+        self.reports_full_sync = reports_full_sync
+        self.gl_weekly = gl_weekly
+        self.gl_daily = gl_daily
+        self.gl_basic_fields = gl_basic_fields
+        self.include_deleted = include_deleted
         self.realm_id = realm_id
         self.refresh_token = refresh_token
         self.token = token
@@ -227,6 +336,14 @@ class Quickbooks():
         self.qb_client_secret = qb_client_secret
         self.session = requests.Session()
         self.access_token = None
+        self.hg_sync_output = hg_sync_output
+        self.sync_finished = False
+        self.report_periods = report_periods
+        # Selected filters passed via --selected-filters (hotglue_singer_sdk
+        # convention). Shape: {"filters_version": "...", "streams": {<stream>: {...}}}.
+        self.selected_filters = selected_filters or {}
+        self.download_attachments = download_attachments is True or (
+            isinstance(download_attachments, str) and download_attachments.lower() == 'true')
 
         self.base_url = "https://sandbox-quickbooks.api.intuit.com/v3/company/" if is_sandbox is True else 'https://quickbooks.api.intuit.com/v3/company/'
 
@@ -291,23 +408,48 @@ class Quickbooks():
 
     # pylint: disable=too-many-arguments
     @backoff.on_exception(backoff.expo,
-                          requests.exceptions.ConnectionError,
+                          (requests.exceptions.ConnectionError,RetriableApiError),
                           max_tries=10,
                           factor=2,
                           on_backoff=log_backoff_attempt)
-    def _make_request(self, http_method, url, headers=None, body=None, stream=False, params=None):
+    def _make_request(self, http_method, url, headers=None, body=None, stream=False, params=None, sink_name=None):
         if http_method == "GET":
             LOGGER.info("Making %s request to %s with params: %s", http_method, url, params)
             resp = self.session.get(url, headers=headers, stream=stream, params=params)
         elif http_method == "POST":
-            LOGGER.info("Making %s request to %s with body %s", http_method, url, body)
+            LOGGER.info(
+                "Making %s request to %s with body %s",
+                http_method,
+                url,
+                redact_for_log(body),
+            )
             resp = self.session.post(url, headers=headers, data=body)
         else:
             raise TapQuickbooksException("Unsupported HTTP method")
 
         try:
+            save_api_usage(
+                http_method,
+                url,
+                params,
+                body,
+                resp,
+                stream=sink_name,
+            )
+        except Exception as e:
+            LOGGER.error("Error saving API usage: %s", str(e))
+
+        if resp.status_code in [400, 429, 500]:
+            intuit_tid = resp.headers.get('intuit_tid', 'N/A')
+            LOGGER.error("Request failed with status %s, intuit_tid: %s, response: %s", resp.status_code, intuit_tid, resp.text)
+            if "Authorization Failure" in resp.text:
+                self.login()
+            raise RetriableApiError(resp.text)
+        try:
             resp.raise_for_status()
         except RequestException as ex:
+            intuit_tid = resp.headers.get('intuit_tid', 'N/A')
+            LOGGER.error("Request exception occurred, intuit_tid: %s, error: %s", intuit_tid, str(ex))
             raise ex
 
         if resp.headers.get('Sforce-Limit-Info') is not None:
@@ -339,10 +481,21 @@ class Quickbooks():
             self.access_token = auth['access_token']
 
             new_refresh_token = auth['refresh_token']
+            LOGGER.info("REFRESH TOKEN: %s", mask_secret(new_refresh_token))
+
+            # persist access_token
+            parser = argparse.ArgumentParser()
+            parser.add_argument('-c', '--config', help='Config file', required=True)
+            _args, unknown = parser.parse_known_args()
+            config_file = _args.config
+            config_content = read_json_file(config_file)
+            config_content['access_token'] = self.access_token
+            write_json_file(config_file, config_content)
 
             # Check if the refresh token is update, if so update the config file with new refresh token.
             if new_refresh_token != self.refresh_token:
-                LOGGER.info(f"Old refresh token [{self.refresh_token}] expired.")
+                LOGGER.info("Old refresh token [%s] expired.", mask_secret(self.refresh_token))
+                LOGGER.info("New Refresh token: %s", mask_secret(new_refresh_token))
                 parser = argparse.ArgumentParser()
                 parser.add_argument('-c', '--config', help='Config file', required=True)
                 _args, unknown = parser.parse_known_args()
@@ -360,11 +513,15 @@ class Quickbooks():
             # NB: requests.models.Response is always falsy here. It is false if status code >= 400
             if isinstance(resp, requests.models.Response):
                 error_message = error_message + ", Response from Quickbooks: {}".format(resp.text)
-            raise Exception(error_message) from e
+            raise InvalidCredentialsError(error_message) from e
         finally:
-            LOGGER.info("Starting new login timer")
-            self.login_timer = threading.Timer(REFRESH_TOKEN_EXPIRATION_PERIOD, self.login)
-            self.login_timer.start()
+            if not self.sync_finished:
+                LOGGER.info("Starting new login timer")
+                self.login_timer = threading.Timer(REFRESH_TOKEN_EXPIRATION_PERIOD, self.login)
+                self.login_timer.start()
+            else:
+                LOGGER.info("Cancelling new timer, sync has already finished.")
+
 
     def describe(self, sobject=None):
         """Describes all objects or a specific object"""
@@ -391,28 +548,163 @@ class Quickbooks():
                                     catalog_entry['tap_stream_id'],
                                     replication_key) or self.default_start_date)
 
+    def fetch_all(self, entity, fields):
+        '''Fetch every record of a Quickbooks entity, selecting only `fields`.
+
+        Used to build reference data for --get-available-filters. Paginates
+        through the Quickbooks query endpoint (max 1000 rows per page).
+        '''
+        if not self.access_token:
+            self.login()
+
+        headers = self._get_standard_headers()
+        headers["Accept"] = "application/json"
+        headers["Content-Type"] = "application/json"
+        url = f"{self.instance_url}/query"
+
+        select = ", ".join(fields)
+        results = []
+        offset = 1
+        max_results = 1000
+
+        while True:
+            query = "SELECT {} FROM {} STARTPOSITION {} MAXRESULTS {}".format(
+                select, entity, offset, max_results)
+            params = {"query": query, "minorversion": "75"}
+            resp = self._make_request('GET', url, headers=headers, params=params, sink_name=entity)
+            records = resp.json().get('QueryResponse', {}).get(entity, [])
+
+            if not records:
+                break
+
+            results.extend(records)
+
+            if len(records) < max_results:
+                break
+
+            offset += max_results
+
+        return results
+
+    @staticmethod
+    def _escape_quotes(value):
+        '''Quote a literal for the Quickbooks query language.
+
+        Strings are wrapped in single quotes with embedded single quotes
+        escaped using a backslash (Quickbooks convention). Non-strings are
+        returned untouched.
+        '''
+        if isinstance(value, str):
+            return "'{}'".format(value.replace("'", "\\'"))
+        return value
+
+    @staticmethod
+    def _extract_id(value):
+        '''Extract the id from a "Name (id)" reference value.
+
+        --get-available-filters labels reference options as "<name> (<id>)" so
+        the selection carries both, but only the id is valid in a Quickbooks
+        query. The last parenthesised group is used so names that themselves
+        contain parentheses (e.g. "LinkedIn Corporation  (CP) (56)") resolve
+        correctly. Values not in that form (e.g. a raw id) are returned as-is.
+        '''
+        if isinstance(value, str):
+            stripped = value.rstrip()
+            if stripped.endswith(")") and "(" in stripped:
+                return stripped[stripped.rfind("(") + 1:-1].strip()
+        return value
+
+    def _parse_clause(self, clause):
+        '''Convert a single `clause_*` entry into a Quickbooks query fragment.
+
+        Returns None when the clause resolves to no usable values (e.g. an
+        empty selection) so callers never emit an invalid `IN ()`.
+        '''
+        operator = clause['operator']
+        raw_value = clause['value']
+
+        if isinstance(raw_value, list):
+            values = [self._extract_id(v) for v in raw_value]
+        else:
+            values = [self._extract_id(raw_value)]
+
+        values = [v for v in values if v not in (None, "")]
+        if not values:
+            return None
+
+        if operator == "EQ":
+            return "{} = {}".format(clause['field'], self._escape_quotes(values[0]))
+        elif operator == "IN":
+            filter_value = ", ".join(str(self._escape_quotes(v)) for v in values)
+            return "{} IN ({})".format(clause['field'], filter_value)
+        else:
+            raise TapQuickbooksException("Unsupported filter operator: {}".format(operator))
+
+    def _parse_filters(self, filters):
+        '''Parse a selected-filters subtree into Quickbooks query fragments.
+
+        hotglue nests clauses under one or more `group_*` envelopes per stream
+        (with `operator_*` glue tokens between them), even when clause nesting
+        is not enabled. Quickbooks (QBO) supports neither nested groups nor OR,
+        so we recurse into every group, collect each `clause_*`, and let the
+        caller AND them together:
+          group_*:    nested subtree (recursed into and flattened)
+          clause_*:   {"field", "operator" (EQ|IN), "value"}
+          operator_*: boolean glue - only AND is representable in QBO
+        '''
+        parsed_filters = []
+        for key, value in filters.items():
+            if key.startswith("group_"):
+                parsed_filters.extend(self._parse_filters(value))
+            elif key.startswith("clause_"):
+                fragment = self._parse_clause(value)
+                if fragment:
+                    parsed_filters.append(fragment)
+            elif key.startswith("operator_"):
+                if isinstance(value, str) and value.strip().upper() == "OR":
+                    raise TapQuickbooksException(
+                        "Quickbooks does not support OR in selected filters; only AND is allowed.")
+
+        return parsed_filters
+
+    def _get_selected_filter_clause(self, stream):
+        '''Returns the WHERE fragment (without the WHERE keyword) for a stream's
+        selected filters, or None when no filters are configured for it.'''
+        stream_filters = self.selected_filters.get("streams", {}).get(stream)
+        if not stream_filters:
+            return None
+
+        LOGGER.info("Parsing '%s' selected filters: %s", stream, stream_filters)
+        parsed_filters = self._parse_filters(stream_filters)
+        if not parsed_filters:
+            return None
+
+        return " AND ".join(parsed_filters)
+
     def _build_query_string(self, catalog_entry, start_date, end_date=None, order_by_clause=True):
         selected_properties = self._get_selected_properties(catalog_entry)
 
-        query = "SELECT {} FROM {}".format("*", catalog_entry['stream'])
+        stream = catalog_entry['stream']
+        query = "SELECT {} FROM {}".format("*", stream)
 
         catalog_metadata = metadata.to_map(catalog_entry['metadata'])
         replication_key = catalog_metadata.get((), {}).get('replication-key')
 
+        conditions = []
+
         if replication_key:
-            where_clause = " WHERE {} >  '{}' ".format(
-                replication_key,
-                start_date)
+            conditions.append("{} >  '{}'".format(replication_key, start_date))
             if end_date:
-                end_date_clause = " AND {} <= {}".format(replication_key, end_date)
-            else:
-                end_date_clause = ""
+                conditions.append("{} <= {}".format(replication_key, end_date))
 
-            # order_by = " ORDERBY {} ASC".format(replication_key)
-            # if order_by_clause:
-            #   return query + where_clause + end_date_clause + order_by
+        # Apply any selected filters for this stream (e.g. filtering Bills by
+        # VendorRef). Provided via the --selected-filters file.
+        filter_clause = self._get_selected_filter_clause(stream)
+        if filter_clause:
+            conditions.append(filter_clause)
 
-            return query + where_clause + end_date_clause
+        if conditions:
+            return query + " WHERE " + " AND ".join(conditions)
         else:
             return query
 
@@ -427,14 +719,30 @@ class Quickbooks():
 
     def query_report(self, catalog_entry, state, state_passed):
         start_date = singer_utils.strptime_with_tz(self.get_start_date(state, catalog_entry))
+
+        if self.reports_full_sync:
+            state_passed = None
+
         if catalog_entry["stream"] == "BalanceSheetReport":
-            reader = BalanceSheetReport(self, start_date, state_passed)
-        elif catalog_entry["stream"] == "GeneralLedgerReport":
-            reader = GeneralLedgerReport(self, start_date, state_passed)
+            reader = BalanceSheetReport(self, start_date, None)
+        elif catalog_entry["stream"] == "MonthlyBalanceSheetReport":
+            reader = MonthlyBalanceSheetReport(self, start_date, None)
+        elif catalog_entry["stream"] == "GeneralLedgerAccrualReport":
+            reader = GeneralLedgerAccrualReport(self, start_date, self.report_periods, state_passed)
+        elif catalog_entry["stream"] == "GeneralLedgerCashReport":
+            reader = GeneralLedgerCashReport(self, start_date, self.report_periods, state_passed)
         elif catalog_entry["stream"] == "CashFlowReport":
-            reader = CashFlowReport(self, start_date, state_passed)
+            reader = CashFlowReport(self, start_date, None)
+        elif catalog_entry["stream"] == "DailyCashFlowReport":
+            reader = DailyCashFlowReport(self, start_date, None)
+        elif catalog_entry["stream"] == "MonthlyCashFlowReport":
+            reader = MonthlyCashFlowReport(self, start_date, None)
+        elif catalog_entry["stream"] == "ARAgingSummaryReport":
+            reader = ARAgingSummaryReport(self, start_date, None)
         elif catalog_entry["stream"] == "TransactionListReport":
-            reader = TransactionListReport(self, start_date, state_passed)
+            reader = TransactionListReport(self, start_date, None)
+        elif catalog_entry["stream"] == "ProfitAndLossReport":
+            reader = ProfitAndLossReport(self, start_date, self.report_periods, state_passed)
         else:
-            reader = ProfitAndLossDetailReport(self, start_date, state_passed)
+            reader = ProfitAndLossDetailReport(self, start_date, self.report_periods, state_passed)
         return reader.sync(catalog_entry)

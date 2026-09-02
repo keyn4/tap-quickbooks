@@ -1,0 +1,111 @@
+import json
+import datetime
+import threading
+import queue
+import os
+from pathlib import Path
+from typing import Any, Mapping, Optional
+
+SECRET_LOG_KEYS = frozenset({"access_token", "client_secret", "refresh_token"})
+
+# Configurable log path
+LOG_FILE_PATH = Path(os.getenv("API_USAGE_LOG", "api_usage.jsonl"))
+
+# Create a queue for thread-safe logging
+_log_queue: Optional[queue.Queue] = None
+_log_thread: Optional[threading.Thread] = None
+_stop_event = threading.Event()
+
+__location__ = os.path.realpath(os.path.join(os.getcwd(), os.path.dirname(__file__)))
+
+
+def get_sync_output_dir():
+    """Returns the shared sync-output root used for downloaded files.
+
+    Mirrors the convention used across hotglue taps: when running on hotglue
+    (``JOB_ID`` set) files are written under ``/home/hotglue/{JOB_ID}/sync-output``,
+    otherwise the current working directory.
+    """
+    job_id = os.environ.get("JOB_ID")
+    if job_id:
+        return f"/home/hotglue/{job_id}/sync-output"
+    return "./sync-output"
+
+
+def mask_secret(value, visible=4):
+    """Return a log-safe token suffix, e.g. RT1-...xvcf -> ***xvcf."""
+    if value is None:
+        return value
+    secret = str(value)
+    if not secret:
+        return secret
+    if len(secret) <= visible:
+        return "***"
+    return f"***{secret[-visible:]}"
+
+
+def redact_for_log(data: Any) -> Any:
+    """Return a copy of request payloads with sensitive fields masked for logging."""
+    if not isinstance(data, Mapping):
+        return data
+    redacted = dict(data)
+    for key in SECRET_LOG_KEYS:
+        if key in redacted:
+            redacted[key] = mask_secret(redacted[key])
+    return redacted
+
+def _log_writer():
+    """Background thread that writes logs to file."""
+    LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    while not _stop_event.is_set():
+        try:
+            log_entry = _log_queue.get(timeout=1.0)
+            with open(LOG_FILE_PATH, "a", encoding="utf-8", errors="replace") as f:
+                f.write(json.dumps(log_entry, default=str) + "\n")
+            _log_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error writing to log file: {e}")
+
+def _ensure_log_thread():
+    """Ensure the logging thread is running."""
+    global _log_queue, _log_thread
+
+    if _log_queue is None:
+        _log_queue = queue.Queue()
+
+    if _log_thread is None or not _log_thread.is_alive():
+        _log_thread = threading.Thread(target=_log_writer, daemon=True)
+        _log_thread.start()
+
+def save_api_usage(method, url, params, body, response, stream=None):
+    _ensure_log_thread()
+
+    request_dict = {
+        "method": method,
+        "url": url,
+        "params": params,
+        "body": body,
+    }
+    request_dict = {k: v for k, v in request_dict.items() if v is not None}
+
+    usage_data = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "request": request_dict,
+        "response_status": response.status_code if response else None,
+    }
+
+    if stream is not None:
+        usage_data["stream"] = stream
+
+    _log_queue.put(usage_data)
+
+def cleanup():
+    """Cleanup function to be called when the application is shutting down."""
+    if _log_queue:
+        _stop_event.set()
+        _log_queue.join()
+    if _log_thread:
+        _log_thread.join(timeout=2)

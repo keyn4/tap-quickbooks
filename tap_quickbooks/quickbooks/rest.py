@@ -4,7 +4,7 @@ import json
 import singer.utils as singer_utils
 
 from requests.exceptions import HTTPError
-from tap_quickbooks.quickbooks.exceptions import TapQuickbooksException
+from tap_quickbooks.quickbooks.exceptions import TapQuickbooksException, raise_for_invalid_credentials
 
 LOGGER = singer.get_logger()
 
@@ -31,7 +31,7 @@ class Rest():
             retries=MAX_RETRIES):
         params = {
             "query": query,
-            "minorversion": "45"
+            "minorversion": "75"
         }
         url = f"{self.qb.instance_url}/query"
         headers = self.qb._get_standard_headers()
@@ -63,16 +63,23 @@ class Rest():
                     yield record
 
         except HTTPError as ex:
-            response = ex.response.json()
-            if isinstance(response, list) and response[0].get("errorCode") == "QUERY_TIMEOUT":
-                start_date = singer_utils.strptime_with_tz(start_date_str)
-                day_range = (end_date - start_date).days
-                LOGGER.info(
-                    "Quickbooks returned QUERY_TIMEOUT querying %d days of %s",
-                    day_range,
-                    catalog_entry['stream'])
-                retryable = True
-            else:
+            try:
+                response = ex.response.json()
+                if isinstance(response, list) and response[0].get("errorCode") == "QUERY_TIMEOUT":
+                    start_date = singer_utils.strptime_with_tz(start_date_str)
+                    day_range = (end_date - start_date).days
+                    LOGGER.info(
+                        "Quickbooks returned QUERY_TIMEOUT querying %d days of %s",
+                        day_range,
+                        catalog_entry['stream'])
+                    retryable = True
+                else:
+                    raise_for_invalid_credentials(ex.response)
+                    # raise any other unhandled exception
+                    raise ex
+            except TapQuickbooksException as qbe:
+                raise qbe
+            except:
                 raise ex
 
         if retryable:
@@ -98,28 +105,52 @@ class Rest():
         headers["Accept"] = "application/json"
         headers["Content-Type"] = "application/json"
 
+        excluded_entities = ["Bill", "Payment", "Transfer", "CompanyInfo", "CreditMemo", "Invoice",
+                            "JournalEntry", "Preferences", "Purchase", "SalesReceipt", "TimeActivity", "BillPayment","Estimate"]
+        
         query = params['query']
-        offset = 0;
-        max = 100
-        while True:
-            params['query'] = f"{query}  STARTPOSITION {offset} MAXRESULTS {max}"
-            resp = self.qb._make_request('GET', url, headers=headers, params=params)
-            resp_json = resp.json()
 
-            # Establish number of records returned.
-            count = resp_json['QueryResponse'].get('maxResults', 0)
+        def sync_records(query, is_deleted=False):            
+            offset = 0
+            max = 100
+            page = 0
 
-            # Make sure there is alteast one record.
-            if count == 0:
-                break;
+            while True:
+                headers.update(self.qb._get_standard_headers())
+                params['query'] = f"{query}  STARTPOSITION {offset} MAXRESULTS {max}"
+                resp = self.qb._make_request('GET', url, headers=headers, params=params)
+                resp_json = resp.json()
 
-            records = resp_json['QueryResponse'][stream];
+                # Establish number of records returned.
+                count = resp_json['QueryResponse'].get('maxResults', 0)
 
-            for i, rec in enumerate(records):
-                yield rec
+                # Make sure there is at least one record.
+                if count == 0:
+                    if is_deleted:
+                        LOGGER.info(f"Response (deleted) with no data {resp_json}")
+                    else:
+                        LOGGER.info(f"Response with no data {resp_json}")
+                    break;
 
-            # This is was chunk
-            if count < max:
-                break;
+                page += 1
+                records = resp_json['QueryResponse'][stream];
 
-            offset += max
+                for _, rec in enumerate(records):
+                    yield rec
+                
+                if count < max:
+                    break;
+
+                offset = (max * page) + 1
+        
+
+        # first fetch all active records
+        yield from sync_records(query)
+
+        # then fetch all deleted records
+        if self.qb.include_deleted and stream not in excluded_entities:
+            if "WHERE" in query:
+                query_deleted = query.replace("WHERE", "where Active = false and")
+            else:
+                query_deleted = f"{query} where Active = false" 
+            yield from sync_records(query_deleted, is_deleted=True)

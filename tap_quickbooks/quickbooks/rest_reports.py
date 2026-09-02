@@ -5,6 +5,9 @@ import attr
 import backoff
 import requests
 import singer
+import time
+
+from tap_quickbooks.util import save_api_usage
 
 LOGGER = singer.get_logger()
 
@@ -13,8 +16,10 @@ def is_fatal_code(e: requests.exceptions.RequestException) -> bool:
     '''Helper function to determine if a Requests reponse status code
     is a "fatal" status code. If it is, the backoff decorator will giveup
     instead of attemtping to backoff.'''
-    return 400 <= e.response.status_code < 500 and e.response.status_code != 429
+    return 400 <= e.response.status_code < 500 and e.response.status_code not in [429, 400]
 
+class RetriableException(Exception):
+    pass
 
 @attr.s
 class QuickbooksStream:
@@ -24,18 +29,9 @@ class QuickbooksStream:
     def _get_abs_path(self, path: str) -> str:
         return os.path.join(os.path.dirname(os.path.realpath(__file__)), path)
 
-    @backoff.on_exception(backoff.fibo,
-                          requests.exceptions.HTTPError,
-                          max_tries=5,
-                          giveup=is_fatal_code)
-    @backoff.on_exception(backoff.fibo,
-                          (requests.exceptions.ConnectionError,
-                           requests.exceptions.Timeout),
-                          max_tries=5)
-    def _get(self, report_entity: str, params: Optional[Dict] = None) -> Dict:
-        '''Constructs a standard way of making
-        a GET request to the Quickbooks REST API.
-        '''
+    def _execute_request(self, report_entity: str, params: Optional[Dict] = None) -> Dict:
+        '''Performs the raw HTTP GET to the Quickbooks Reports API, raises on error,
+        and returns the parsed JSON. No backoff — callers add their own decorator.'''
         url = f"{self.qb.instance_url}/reports/{report_entity}"
         headers = self.qb._get_standard_headers()
 
@@ -43,8 +39,44 @@ class QuickbooksStream:
             params.update({"minorversion": self.api_minor_version})
 
         response = requests.get(url, headers=headers, params=params)
+
+        try:
+            save_api_usage("GET", url, params, None, response, self.stream)
+        except Exception as e:
+            LOGGER.error("Error saving API usage: %s", str(e))
+
+        if response.status_code == 429:
+            # quickbooks: HTTP Status Code 429 happens when throttling occurs. 
+            # Wait 60 seconds before retrying the request.
+            time.sleep(60)
         response.raise_for_status()
-        return response.json()
+
+        # handle random empty responses or not valid json responses
+        try:
+            res_json = response.json()
+        except:
+            raise RetriableException(f"Invalid json response: {response.text} ")
+        
+        if res_json == None:
+            raise RetriableException(f"Empty response returned {response.text} ")
+        
+        return res_json
+
+    @backoff.on_exception(backoff.expo,
+                          requests.exceptions.HTTPError,
+                          max_tries=10,
+                          factor=3,
+                          giveup=is_fatal_code)
+    @backoff.on_exception(backoff.expo,
+                          (requests.exceptions.ConnectionError,
+                           requests.exceptions.Timeout,
+                           RetriableException
+                           ),
+                          max_tries=10,
+                          factor=3)
+    def _get(self, report_entity: str, params: Optional[Dict] = None) -> Dict:
+        '''GET with backoff. 504s are retried like any other 5xx.'''
+        return self._execute_request(report_entity, params)
 
     def _convert_string_value_to_float(self, value: str) -> float:
         '''Safely converts string values to floats.'''
